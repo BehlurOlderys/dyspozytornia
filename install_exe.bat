@@ -1,0 +1,1 @@
+pyinstaller -F --paths=venv\Lib\site-packages package\main.py --icon=4lufy.ico --noconsole
