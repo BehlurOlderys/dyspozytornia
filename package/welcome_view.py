@@ -1,10 +1,49 @@
-from PyQt5.QtWidgets import QInputDialog, QLabel, QGridLayout, QLineEdit, QHBoxLayout, QWidget, QVBoxLayout, QPushButton, QComboBox
+from PyQt5.QtWidgets import QInputDialog, QLabel, QGridLayout, QSpacerItem, QSizePolicy,  QLineEdit, QMainWindow, QWidget, QVBoxLayout, QPushButton, QComboBox
+from PyQt5.QtGui import QPixmap, QImage, QPainter, QPen, QIcon
+from PyQt5.QtCore import Qt
+
 import logging
 from config_manager import save_config
-import copy
 
 
 logger = logging.getLogger(__name__)
+
+
+class ResizeableLabelWithImage(QLabel):
+    def __init__(self, parent, initial_image: QImage = None):
+        QLabel.__init__(self, parent)
+        self.setMinimumSize(640, 480)
+
+        if initial_image is not None:
+            # initial_image = QImage("default.png")
+            self._original_qimage = initial_image
+            self._current_qimage = initial_image
+            self._original_pixmap = QPixmap(self._original_qimage)
+            self.setPixmap(self._original_pixmap)
+        self._zoom_factor = 1.0
+        self._stretched = False
+        self._grid = False
+
+    def _update_image_size(self):
+        self._original_pixmap = QPixmap(self._current_qimage)
+        self._original_pixmap = self._original_pixmap.scaled(int(self._zoom_factor*self.width()), int(self._zoom_factor*self.height()), Qt.KeepAspectRatio)
+        self.setPixmap(self._original_pixmap)
+
+    def resizeEvent(self, event):
+        self._update_image_size()
+
+
+class ViewImageWindow(QMainWindow):
+    def __init__(self, parent):
+        super(ViewImageWindow, self).__init__(parent)
+        self.setWindowIcon(QIcon('4lufy.ico'))
+        self._main_layout = QVBoxLayout()
+        self._image_label = ResizeableLabelWithImage(parent=self, initial_image=QImage("default.png"))
+        self.setCentralWidget(self._image_label)
+
+    def show_yourself(self, unit_name):
+        self.setWindowTitle(f"View last image from {unit_name}")
+        self.show()
 
 
 class WelcomeView(QWidget):
@@ -65,10 +104,17 @@ class WelcomeView(QWidget):
         self._grid.addWidget(QLabel("Saving images"), 0, CURRENT_COL)
         CURRENT_COL += 1
 
+        view_image_window = ViewImageWindow(parent=self)
+
         self._connect_buttons = {}
+        self._view_buttons = {}
+
+        def view(u):
+            print(f"Viewing from {u}")
+            view_image_window.show_yourself(u)
 
         def connect(u):
-            print(f"Connecting to ip {u}")
+            print(f"Connecting to {u}")
 
         ROW_SHIFT=2
         for index, unit in enumerate(self._config["units"]):
@@ -77,10 +123,15 @@ class WelcomeView(QWidget):
             self._grid.addWidget(QLabel(unit_name), index+ROW_SHIFT, 0)
             self._grid.addWidget(QLabel(unit_ip), index+ROW_SHIFT, 1)
             self._connect_buttons[unit_name] = QPushButton(f"Connect")
+            self._connect_buttons[unit_name].clicked.connect(lambda always_false, z=unit_name: connect(z))
             self._grid.addWidget(self._connect_buttons[unit_name], index+ROW_SHIFT, 2)
             self._grid.addWidget(QLabel("<status>"), index+ROW_SHIFT, 3)
             self._grid.addWidget(QLabel("<unknown>"), index+ROW_SHIFT, 4)
-            self._grid.addWidget(QPushButton("View"), index+ROW_SHIFT, 5)
+
+            self._view_buttons[unit_name] = QPushButton("View")
+            self._view_buttons[unit_name].clicked.connect(lambda always_false, z=unit_name: view(z))
+            self._grid.addWidget(self._view_buttons[unit_name], index+ROW_SHIFT, 5)
+
             self._grid.addWidget(QPushButton("Set exp"),  index+ROW_SHIFT, 6)
             self._grid.addWidget(QLabel("<value>"),  index+ROW_SHIFT, 7)
             self._grid.addWidget(QPushButton("Set gain"),  index+ROW_SHIFT, 8)
@@ -100,6 +151,7 @@ class WelcomeView(QWidget):
             self._grid.addWidget(QPushButton("Start/Stop"), index+ROW_SHIFT, 15)
 
         self._main_layout.addLayout(self._grid)
+        self._main_layout.addItem(QSpacerItem(0, 0, QSizePolicy.Expanding, QSizePolicy.Expanding))
         self.setLayout(self._main_layout)
 
     def _save_to_config(self, d: dict):
