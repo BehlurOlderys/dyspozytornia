@@ -1,8 +1,8 @@
 {
   "units": [
-    {"ip": "192.168.1.101", "name": "red-nano"},
-    {"ip": "192.168.1.102", "name": "green-nano"},
-    {"ip": "192.168.1.103", "name": "blue-nano"},
-    {"ip": "192.168.1.104", "name": "yellow-nano"}
+    "red-nano",
+    "green-nano",
+    "blue-nano",
+    "yellow-nano"
   ]
 }
