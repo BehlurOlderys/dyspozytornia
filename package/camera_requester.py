@@ -150,7 +150,7 @@ class CameraRequester:
     def get_current_format(self):
         return self._get_pair_success_and_value("get_readoutmode_str")
 
-    def get_exposure(self):
+    def get_exposure_us(self):
         return self._get_pair_success_and_value("get_exposure")
 
     def get_status(self):
