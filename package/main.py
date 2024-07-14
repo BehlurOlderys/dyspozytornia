@@ -6,6 +6,7 @@ import sys
 import logging
 from logging.handlers import RotatingFileHandler
 import qdarktheme
+import subprocess
 
 
 logger = logging.getLogger(__name__)
@@ -50,6 +51,13 @@ def configure_logging(logfile_path):
 
 
 if __name__ == '__main__':
+    # TODO: make this available and print result ok or not!
+    # user = "pi"
+    # host = "red-nano"
+    # cmd = "\"supervisorctl restart gunicorn\""
+    # subprocess.Popen(f"ssh {user}@{host} {cmd}", shell=True, stdout=subprocess.PIPE,
+    #                  stderr=subprocess.PIPE).communicate()
+
     configure_logging("main.log")
     logger.debug("Logging works, starting Qt...")
     app = QApplication(sys.argv)
