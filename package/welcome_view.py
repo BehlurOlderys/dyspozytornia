@@ -1,6 +1,6 @@
 import subprocess
-
-from PyQt5.QtWidgets import QInputDialog, QLabel, QGridLayout, QSlider, QSpacerItem, QSizePolicy, QHBoxLayout, QLineEdit, QMainWindow, QWidget, QVBoxLayout, QPushButton, QComboBox
+from blind_solver import blind_solve_image
+from PyQt5.QtWidgets import QInputDialog, QScrollArea, QLabel, QGridLayout, QSlider, QSpacerItem, QSizePolicy, QHBoxLayout, QLineEdit, QMainWindow, QWidget, QVBoxLayout, QPushButton, QComboBox
 from PyQt5.QtGui import QPixmap, QImage, QPainter, QPen, QIcon, QFont
 from PyQt5.QtCore import Qt
 import numpy as np
@@ -8,9 +8,13 @@ import logging
 from config_manager import save_config
 from utils import start_repeated_task
 from camera_requester import standalone_get_request, standalone_post_request, CameraRequester
-from time import time
+from time import time, sleep
 from threading import Event
 import re
+import os
+from ssh_client import send_command_via_ssh
+from PIL import Image
+import tifffile
 
 
 logger = logging.getLogger(__name__)
@@ -46,13 +50,38 @@ def qimage_from_buffer(content, resolution, image_format):
 
     img = np.frombuffer(content, dtype=buffer_type)
     w, h = resolution
-    logger.debug(f"Reshaping into {w}x{h}...")
+    logger.debug(f"Reshaping into {h}x{w}...")
     original_img = img.reshape(w, h)
     logger.debug(f"dimension = {original_img.shape}, Max = {np.max(original_img)}, min = {np.min(original_img)}")
     # final_img = normalize_image(original_img, is16b=is16b)
     logger.debug("Normalized!")
     q_img = QImage(original_img.data, original_img.shape[0], original_img.shape[1], image_format)
     return q_img, original_img
+
+
+def save_to_unique_file_from_buffer(file_prefix, content, resolution, image_format):
+    logger.debug(f"Creating image with format {image_format}")
+    is16b = (image_format == "RAW16")
+    buffer_type = np.uint16 if is16b else np.uint8
+    img = np.frombuffer(content, dtype=buffer_type)
+    w, h = resolution
+    logger.debug(f"Reshaping into {w}x{h}...")
+    original_img = img.reshape(h, w)
+    logger.debug(f"dimension = {original_img.shape}, Max = {np.max(original_img)}, min = {np.min(original_img)}")
+    # im = Image.fromarray(original_img)
+    # tiff_image =
+
+    try:
+        cwd = os.getcwd()
+        timestamp = str(time())
+        file_path = os.path.join(cwd, f"{file_prefix}_{timestamp}.tif")
+        logger.debug(f"Saving into path: {file_path}")
+        tifffile.imwrite(file_path, original_img, photometric=1)
+        logger.debug("Created tiff image successfully")
+    except Exception as e:
+        logger.error(e)
+    logger.debug(f"Saved image into {file_path}")
+    return file_path
 
 
 def get_cameras_list(try_ip):
@@ -84,7 +113,7 @@ def connect_to_camera(camera_name, camera_index, current_ip):
 class ResizeableLabelWithImage(QLabel):
     def __init__(self, parent, initial_image: QImage = None):
         QLabel.__init__(self, parent)
-        self.setMinimumSize(640, 480)
+        # self.setMinimumSize(640, 480)
         self._hmin = 0
         self._hmax = 100
         if initial_image is not None:
@@ -97,6 +126,14 @@ class ResizeableLabelWithImage(QLabel):
         self._stretched = False
         self._grid = False
         self._histogram = False
+
+    def zoom_in(self):
+        self._zoom_factor *= 1.5
+        self._update_image_size()
+
+    def zoom_out(self):
+        self._zoom_factor /= 1.5
+        self._update_image_size()
 
     def adjust_histogram(self, hmin, hmax):
         if hmin < 0 or hmax < 0 or hmin > 100 or hmax > 100 or hmax == hmin:
@@ -154,10 +191,43 @@ class ResizeableLabelWithImage(QLabel):
 
     def _update_image_size(self):
         self._original_pixmap = QPixmap(self._current_qimage)
-        self._original_pixmap = self._original_pixmap.scaled(int(self._zoom_factor*self.width()), int(self._zoom_factor*self.height()), Qt.KeepAspectRatio)
+        if self._grid:
+            self._draw_grid()
+        w = self._current_qimage.width()
+        h = self._current_qimage.height()
+        self._original_pixmap = self._original_pixmap.scaled(int(self._zoom_factor*w), int(self._zoom_factor*h), Qt.KeepAspectRatio)
         self.setPixmap(self._original_pixmap)
 
     def resizeEvent(self, event):
+        self._update_image_size()
+
+    def _draw_grid(self):
+        painter = QPainter(self._original_pixmap)
+        pen = QPen(Qt.red, 2)
+        painter.setPen(pen)
+        hdivisions = 9
+        vdivisions = 9
+        max_w = self._original_pixmap.width()
+        max_h = self._original_pixmap.height()
+        increment_w = int(max_w / hdivisions)
+        for i in range(0, hdivisions):
+            begin_x = int(increment_w * (i + 0.5))
+            end_y = int(max_h - 1)
+            painter.drawLine(begin_x, 0, begin_x, end_y)
+
+        increment_h = int(max_h / vdivisions)
+        for i in range(0, vdivisions):
+            begin_y = int(increment_h * (i + 0.5))
+            end_x = int(max_w - 1)
+            painter.drawLine(0, begin_y, end_x, begin_y)
+        painter.end()
+
+    def turn_grid_on(self):
+        self._grid = True
+        self._update_image_size()
+
+    def turn_grid_off(self):
+        self._grid = False
         self._update_image_size()
 
 
@@ -177,12 +247,32 @@ def get_last_image_as_qimage(unit_name, camera_index):
     return q_img
 
 
+def save_last_image_locally(unit_name, camera_index):
+    is_ok1, (w, h) = CameraRequester(unit_name, camera_index).get_resolution()
+    is_ok2, current_format = CameraRequester(unit_name, camera_index).get_current_format()
+    if not is_ok1 or not is_ok2:
+        logger.error("Could not get required image parameters from camera")
+        return None
+    start_time = time()
+    response = CameraRequester(unit_name, camera_index).get_last_image(send_as_jpg=False)
+    time_elapsed = time() - start_time
+    logger.debug(f"Time elapsed on receiving response: {time_elapsed}s")
+    if response is None:
+        return response
+    kkk = save_to_unique_file_from_buffer(unit_name, response.content, [w, h], current_format)
+    logger.debug("Saved last image to tiff")
+    return kkk
+
+
 class ImageView(QWidget):
     def __init__(self):
         super(ImageView, self).__init__()
         self._main_layout = QHBoxLayout()
         self._image_label = ResizeableLabelWithImage(parent=self, initial_image=QImage("default.png"))
-        self._main_layout.addWidget(self._image_label)
+        scroll = QScrollArea()
+        scroll.setWidget(self._image_label)
+        scroll.setWidgetResizable(True)
+        self._main_layout.addWidget(scroll)
         self._current_index = -1
         self._current_name = ""
         button_layout = QVBoxLayout()
@@ -190,6 +280,20 @@ class ImageView(QWidget):
         refresh_button = QPushButton("Refresh")
         refresh_button.clicked.connect(self._refresh)
         button_layout.addWidget(refresh_button)
+
+        self._grid_button = QPushButton("Grid ON")
+        self._grid_button.clicked.connect(self._grid_on_clicked)
+        self._grid_button.setCheckable(True)
+        self._grid_button.setStyleSheet("background-color : black")
+        button_layout.addWidget(self._grid_button)
+
+        zoom_in_button = QPushButton("Zoom in (+)")
+        zoom_in_button.clicked.connect(self._zoom_in)
+        button_layout.addWidget(zoom_in_button)
+
+        zoom_out_button = QPushButton("Zoom out (-)")
+        zoom_out_button.clicked.connect(self._zoom_out)
+        button_layout.addWidget(zoom_out_button)
 
         def add_button_move_focuser(value: int):
             button_move_focuser = QPushButton(f"Move {value}")
@@ -211,6 +315,26 @@ class ImageView(QWidget):
         self._slider_max.sliderReleased.connect(self._slider_released)
         self._main_layout.addWidget(self._slider_max)
         self.setLayout(self._main_layout)
+
+    def _grid_on_clicked(self):
+        value = self._grid_button.isChecked()
+        if value:
+            self._grid_button.setChecked(True)
+            self._grid_button.setStyleSheet("background-color : #228822")
+            self._grid_button.setText("Grid OFF")
+            self._image_label.turn_grid_on()
+        else:
+            self._grid_button.setText("Grid ON")
+            self._grid_button.setStyleSheet("background-color : black")
+            self._grid_button.setChecked(False)
+            self._image_label.turn_grid_off()
+
+
+    def _zoom_in(self):
+        self._image_label.zoom_in()
+
+    def _zoom_out(self):
+        self._image_label.zoom_out()
 
     def _slider_released(self):
         minp = self._slider_min.value()
@@ -278,6 +402,31 @@ class WelcomeView(QWidget):
 
     def _prepare_ui(self):
         self._main_layout = QVBoxLayout()
+        initial_coordinates_layout = QHBoxLayout()
+        initial_ra_label = QLabel("Initial RA:")
+        initial_ra_label.setMaximumWidth(60)
+        initial_coordinates_layout.addWidget(initial_ra_label)
+        self._initial_ra = QLineEdit("17")
+        self._initial_ra.setMaximumWidth(100)
+        initial_coordinates_layout.addWidget(self._initial_ra)
+        initial_dec_label = QLabel("Initial DEC:")
+        initial_dec_label.setMaximumWidth(70)
+        initial_coordinates_layout.addWidget(initial_dec_label)
+        self._initial_dec = QLineEdit("30")
+        self._initial_dec.setMaximumWidth(100)
+        initial_coordinates_layout.addWidget(self._initial_dec)
+        initial_coordinates_layout.addItem(QSpacerItem(0, 0, QSizePolicy.Expanding, QSizePolicy.Expanding))
+        solved_ra_label = QLabel("Solved RA:")
+        solved_ra_label.setMaximumWidth(60)
+        initial_coordinates_layout.addWidget(solved_ra_label)
+        self._solved_ra = QLabel("<unknown>")
+        initial_coordinates_layout.addWidget(self._solved_ra)
+        solved_dec_label = QLabel("Solved DEC:")
+        solved_dec_label.setMaximumWidth(70)
+        initial_coordinates_layout.addWidget(solved_dec_label)
+        self._solved_dec = QLabel("<unknown>")
+        initial_coordinates_layout.addWidget(self._solved_dec)
+        self._main_layout.addLayout(initial_coordinates_layout)
         self._grid = QGridLayout()
 
         CURRENT_COL = 0
@@ -309,15 +458,15 @@ class WelcomeView(QWidget):
         self._grid.addWidget(QPushButton("Calculate"), 1, CURRENT_COL)
         CURRENT_COL += 1
 
-        self._grid.addWidget(QLabel("Last image"), 0, CURRENT_COL)
+        WIDTH = 3
+        self._grid.addWidget(QLabel("Last image"), 0, CURRENT_COL, 1, WIDTH)
+        CURRENT_COL += WIDTH
+
+        self._grid.addWidget(QLabel("Exposure"), 0, CURRENT_COL)
         CURRENT_COL += 1
 
-        WIDTH = 2
-        self._grid.addWidget(QLabel("Exposure"), 0, CURRENT_COL, 1, WIDTH)
-        CURRENT_COL += WIDTH
-
-        self._grid.addWidget(QLabel("Gain"), 0, CURRENT_COL, 1, WIDTH)
-        CURRENT_COL += WIDTH
+        self._grid.addWidget(QLabel("Gain"), 0, CURRENT_COL)
+        CURRENT_COL += 1
 
         self._grid.addWidget(QLabel("Cooling"), 0, CURRENT_COL)
         self._all_coolers_button = QPushButton("Turn on")
@@ -349,12 +498,17 @@ class WelcomeView(QWidget):
         CURRENT_COL += 1
 
         self._grid.addWidget(QLabel("Saving images"), 0, CURRENT_COL)
+        self._start_all_button = QPushButton("Start all")
+        self._start_all_button.clicked.connect(self._start_save_all)
+        self._grid.addWidget(self._start_all_button, 1, CURRENT_COL)
         CURRENT_COL += 1
 
         view_image_window = ViewImageWindow(parent=self)
 
+        self._gain_edits = {}
         self._cameras_combos = {}
         self._view_buttons = {}
+        self._solve_buttons = {}
         self._exp_edits = {}
         self._capture_number_edits = {}
         self._pingable = {}
@@ -367,11 +521,37 @@ class WelcomeView(QWidget):
         self._set_temperature_display = {}
         self._start_capture_buttons = {}
         self._capture_number = {}
-        self._dir_name_combo = {}
+        self._capture_prefix_edit = {}
+        self._reachable_labels = {}
+
+        def save_tmp(u):
+            if not self._reacheable[u]:
+                print(f"Cannot save from {u}")
+                return
+            print(f"Saving locally from {u}")
+            i = self._cameras_combos[unit_name].currentIndex()
+            save_last_image_locally(u, i)
+            logger.debug("Saved tiff image")
+
+        def solve_tmp(u):
+            if not self._reacheable[u]:
+                print(f"Cannot save from {u}")
+                return
+            print(f"Saving locally from {u}")
+            i = self._cameras_combos[unit_name].currentIndex()
+            file_path = save_last_image_locally(u, i)
+            logger.debug("Saved tiff image")
+            initial_ra = float(self._initial_ra.text())
+            initial_dec = float(self._initial_dec.text())
+            print(f"Using initial values: RA={initial_ra}, DEC={initial_dec}")
+            (rh, rm, rs), (dh, dm, ds) = blind_solve_image(file_path, initial_ra, initial_dec)
+
+            self._solved_ra.setText(f"{rh}:{rm}:{rs}")
+            self._solved_dec.setText(f"{dh}:{dm}:{ds}")
 
         def view(u):
-            if not self._reacheable[unit_name]:
-                print(f"Cannot view from {unit_name}")
+            if not self._reacheable[u]:
+                print(f"Cannot view from {u}")
                 return
             print(f"Viewing from {u}")
             i = self._cameras_combos[unit_name].currentIndex()
@@ -398,14 +578,12 @@ class WelcomeView(QWidget):
                 cameras_list = get_cameras_list(unit_name)
             self._reacheable[unit_name] = cameras_list is not None
             reachable_label = QLabel()
-            reachable_label.setText("YES" if self._reacheable[unit_name] else "NO")
-            reachable_color = "green" if self._reacheable[unit_name] else "red"
             reachable_font = QFont()
             reachable_font.setBold(True)
             reachable_label.setFont(reachable_font)
-            reachable_label.setStyleSheet(f"color: {reachable_color}")
-
+            self._reachable_labels[unit_name] = reachable_label
             self._grid.addWidget(reachable_label, index+ROW_SHIFT, CURRENT_COL)
+            self._refresh_reachable_label(unit_name)
             CURRENT_COL += 1
             self._cameras_combos[unit_name] = QComboBox()
             self._refresh_cameras_combo(cameras_list, unit_name)
@@ -421,6 +599,7 @@ class WelcomeView(QWidget):
             current_exposure_text = "<<exposure time>>"
             current_binning_txt = "x4"
             set_temp_text = "<<value>>"
+            current_gain_text = "<<value>>"
             # TODO: should ask for temperature and update this every few seconds:
             camera_temp_text = "<<temp unknown>>"
             if self._reacheable[unit_name]:
@@ -438,7 +617,6 @@ class WelcomeView(QWidget):
                             CameraRequester(unit_name, current_index).set_binning(bin_value)
                             format_str = "RAW16"
                             CameraRequester(unit_name, current_index).set_format(format_str)
-                            CameraRequester(unit_name, current_index).set_exposure("1")
                             CameraRequester(unit_name, current_index).start_capturing()
 
                             ok, is_cooler_on = CameraRequester(unit_name, current_index).get_cooler_on()
@@ -463,6 +641,9 @@ class WelcomeView(QWidget):
                                     current_exposure_text = f"{exposure_us/US_IN_MILLISECOND}ms"
                                 else:
                                     current_exposure_text = f"{exposure_us}us"
+                            ok, gain = CameraRequester(unit_name, current_index).get_gain()
+                            if ok:
+                                current_gain_text = str(gain)
 
             self._camera_statuses[unit_name] = QLabel(camera_status_text)
             self._grid.addWidget(self._camera_statuses[unit_name], index+ROW_SHIFT, CURRENT_COL)
@@ -475,7 +656,14 @@ class WelcomeView(QWidget):
             self._grid.addWidget(self._view_buttons[unit_name], index+ROW_SHIFT, CURRENT_COL)
             CURRENT_COL += 1
 
-            self._grid.addWidget(QPushButton("Set exp"),  index+ROW_SHIFT, CURRENT_COL)
+            self._view_buttons[unit_name] = QPushButton("Save")
+            self._view_buttons[unit_name].clicked.connect(lambda always_false, z=unit_name: save_tmp(z))
+            self._grid.addWidget(self._view_buttons[unit_name], index+ROW_SHIFT, CURRENT_COL)
+            CURRENT_COL += 1
+
+            self._solve_buttons[unit_name] = QPushButton("Solve")
+            self._solve_buttons[unit_name].clicked.connect(lambda always_false, z=unit_name: solve_tmp(z))
+            self._grid.addWidget(self._solve_buttons[unit_name], index+ROW_SHIFT, CURRENT_COL)
             CURRENT_COL += 1
 
             self._exp_edits[unit_name] = QLineEdit(current_exposure_text)
@@ -483,9 +671,9 @@ class WelcomeView(QWidget):
             self._grid.addWidget(self._exp_edits[unit_name],  index+ROW_SHIFT, CURRENT_COL)
 
             CURRENT_COL += 1
-            self._grid.addWidget(QPushButton("Set gain"),  index+ROW_SHIFT, CURRENT_COL)
-            CURRENT_COL += 1
-            self._grid.addWidget(QLabel("<value>"),  index+ROW_SHIFT, CURRENT_COL)
+            self._gain_edits[unit_name] = QLineEdit(current_gain_text)
+            self._gain_edits[unit_name].returnPressed.connect(lambda u=unit_name: self._pressed_gain_edit(u))
+            self._grid.addWidget(self._gain_edits[unit_name], index+ROW_SHIFT, CURRENT_COL)
             CURRENT_COL += 1
 
             ############################################################################
@@ -512,13 +700,13 @@ class WelcomeView(QWidget):
             self._grid.addWidget(bin_combo,  index+ROW_SHIFT, CURRENT_COL)
             CURRENT_COL += 1
 
-            capture_type_combo = QComboBox()
-            capture_type_combo.addItems(["light", "flat", "dark", "bias"])
-            self._grid.addWidget(capture_type_combo,  index+ROW_SHIFT, CURRENT_COL)
-            self._dir_name_combo[unit_name] = capture_type_combo
+            capture_prefix_edit = QLineEdit("light")
+            self._grid.addWidget(capture_prefix_edit,  index+ROW_SHIFT, CURRENT_COL)
+            self._capture_prefix_edit[unit_name] = capture_prefix_edit
             CURRENT_COL += 1
             self._capture_number_edits[unit_name] = QLineEdit("1")
             self._capture_number_edits[unit_name].returnPressed.connect(lambda u=unit_name: self._changed_capture_number(u))
+            self._capture_number_edits[unit_name].textChanged.connect(lambda nt, u=unit_name: self._changed_capture_number(u))
             self._grid.addWidget(self._capture_number_edits[unit_name], index + ROW_SHIFT, CURRENT_COL)
             CURRENT_COL += 1
 
@@ -535,9 +723,18 @@ class WelcomeView(QWidget):
         ######################
         self._add_task(5, self._refresh_statuses, "refresh_statuses")
 
+    def _refresh_reachable_label(self, unit_name):
+        self._reachable_labels[unit_name].setText("YES" if self._reacheable[unit_name] else "NO")
+        reachable_color = "green" if self._reacheable[unit_name] else "red"
+        self._reachable_labels[unit_name].setStyleSheet(f"color: {reachable_color}")
+
+    def _start_save_all(self):
+        for unit_name in self._config["units"]:
+           self._start_capture(unit_name)
+
     def _changed_capture_number(self, unit_name):
         if not self._reacheable[unit_name]:
-            print(f"Cannot change capture number in {unit_name}")
+            logger.debug(f"Cannot change capture number in {unit_name}")
             return
 
         number_raw = self._capture_number_edits[unit_name].text()
@@ -549,6 +746,7 @@ class WelcomeView(QWidget):
         if number < 1 or number > 10000:
             logger.warning(f"Number of captures [{number}] for {unit_name} is outside allowed range (1-10000)")
             return
+        logger.debug(f"Setting new capture number for {unit_name}: {number}")
         self._capture_number[unit_name] = number
 
     def _refresh_statuses(self):
@@ -576,9 +774,9 @@ class WelcomeView(QWidget):
         is_checked = button.isChecked()
         if is_checked:
             number = self._capture_number[unit_name]
-            dir_name = self._dir_name_combo[unit_name].currentText()
-            logger.debug(f"Starting saving {number} frames in directory {dir_name} on {unit_name}")
-            result = CameraRequester(unit_name, camera_index).start_saving(number, dir_name)
+            capture_type = self._capture_prefix_edit[unit_name].text()
+            logger.debug(f"Starting saving {number} frames with capture type {capture_type} on {unit_name}")
+            result = CameraRequester(unit_name, camera_index).start_saving(number, "Capture", f"{capture_type}_{unit_name}")
         else:
             logger.debug(f"Stopping saving on {unit_name}")
             result = CameraRequester(unit_name, camera_index).stop_saving()
@@ -601,6 +799,15 @@ class WelcomeView(QWidget):
             button.setStyleSheet("background-color : black")
             button.setChecked(False)
 
+    def _refresh_cooler_status(self, unit_name: str, camera_index: int):
+        ok, is_on = CameraRequester(unit_name, camera_index).get_cooler_on()
+        if not ok:
+            return
+        camera_cooling_status_text = "YES" if is_on else "NO"
+        camera_cooling_status_color = "green" if is_on else "red"
+        self._cooling_labels[unit_name].setText(camera_cooling_status_text)
+        self._cooling_labels[unit_name].setStyleSheet(f"color: {camera_cooling_status_color}")
+
     def _turn_all_coolers(self):
         value = self._all_coolers_button.isChecked()
         if value:
@@ -622,12 +829,7 @@ class WelcomeView(QWidget):
             onoroff = "on" if value else "off"
             print(f"Turning cooler at {unit_name} {onoroff}: {result}")
 
-            ok, is_on = CameraRequester(unit_name, camera_index).get_cooler_on()
-            if ok:
-                camera_cooling_status_text = "YES" if is_on else "NO"
-                camera_cooling_status_color = "green" if is_on else "red"
-                self._cooling_labels[unit_name].setText(camera_cooling_status_text)
-                self._cooling_labels[unit_name].setStyleSheet(f"color: {camera_cooling_status_color}")
+            self._refresh_cooler_status(unit_name, camera_index)
 
     def _set_desired_temperature_for_all(self):
         value = int(self._set_temperature_edit.text())
@@ -640,6 +842,25 @@ class WelcomeView(QWidget):
             ok, temp = CameraRequester(unit_name, camera_index).get_set_temp()
             if ok:
                 self._set_temperature_display[unit_name].setText(str(temp))
+
+    def _pressed_gain_edit(self, unit_name):
+        if not self._reacheable[unit_name]:
+            print(f"Cannot change gain in {unit_name}")
+            return
+        camera_index = self._cameras_combos[unit_name].currentIndex()
+        gain_raw = self._gain_edits[unit_name].text()
+        try:
+            gain = int(gain_raw)
+        except Exception as e:
+            logger.warning(f"Failed set new gain in {unit_name}: value {gain_raw} cannot be converted to int!")
+            return
+        result = CameraRequester(unit_name, camera_index).set_gain(gain)
+        logger.debug(f"Result from setting gain on {unit_name}: {result}")
+        ok, check_gain = CameraRequester(unit_name, camera_index).get_gain()
+        if ok and int(check_gain) == int(gain):
+            print(f"Gain change successful to {gain}")
+        else:
+            print(f"Gain change failed: result={ok} value received={check_gain} while expecting {gain}")
 
     def _pressed_exp_edit(self, unit_name):
         if not self._reacheable[unit_name]:
@@ -669,6 +890,12 @@ class WelcomeView(QWidget):
             logger.warning(f"Exposure outside range: {new_exp}us")
         logger.debug(f"Unit name = {unit_name}, exp_raw = {exp_raw}, new_exp={new_exp}")
         CameraRequester(unit_name, camera_index).set_exposure(new_exp)
+        ok, check_exp = CameraRequester(unit_name, camera_index).get_exposure_us()
+        check_exp_s = int(check_exp/1000000)
+        if ok and check_exp_s == int(new_exp):
+            logger.debug(f"Exposure change successful to {new_exp}")
+        else:
+            logger.error(f"Exposure change failed: result={ok} value received={check_exp_s}s while expecting {new_exp}s")
 
     def _prepare_pingable_label(self, unit_name):
         self._ping_labels[unit_name].setText("YES" if self._pingable[unit_name] else "NO")
@@ -720,16 +947,28 @@ class WelcomeView(QWidget):
                 print("WTF?!?!")
                 if cameras_list is None:
                     try:
-                        result = subprocess.check_output([f"ssh pi@{unit_name} \"supervisorctl restart gunicorn\""]).decode("UTF-8")
+                        send_command_via_ssh(unit_name, "supervisorctl restart gunicorn")
                     except Exception as e:
-                        print(f"Exception while checking output: {e}")
+                        print(f"Exception while sending command: {e}")
                         continue
-                    print(f"Result of restarting server: {result}")
+                    sleep(3)
                     cameras_list = get_cameras_list(unit_name)
                 if cameras_list is None:
                     print(f"Failed to get cameras even after gunicorn restart. Continuing to next...")
                     continue
                 print(f"Trying to refresh cameras combo for {unit_name} with {cameras_list}")
                 self._reacheable[unit_name] = True
-                self._refresh_cameras_combo(cameras_list)
+                self._refresh_reachable_label(unit_name)
+                self._refresh_cameras_combo(cameras_list, unit_name)
+
+                current_camera = self._cameras_combos[unit_name].currentText()
+                if current_camera is not EMPTY_CAMERA_LIST_ITEM:
+                    current_index = self._cameras_combos[unit_name].currentIndex()
+                    result = connect_to_camera(current_camera, current_index, unit_name)
+                    if result is not None:
+                        ok, status = result
+                        if ok:
+                            camera_status_text = status["state"]
+                            self._camera_statuses[unit_name].setText(camera_status_text)
+                            self._refresh_cooler_status(unit_name, current_index)
 

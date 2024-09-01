@@ -4,3 +4,9 @@ dist/*
 *.pyc
 /main.log
 /main.spec
+*.tif
+*.fit
+*.tiff
+*.fits
+*.wcs
+*.ini
